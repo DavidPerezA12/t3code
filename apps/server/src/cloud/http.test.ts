@@ -13,6 +13,7 @@ import {
   type RelayLinkProofRequest,
 } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
+import * as TestClock from "effect/testing/TestClock";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import { HttpClient, HttpServer } from "effect/http";
@@ -22,8 +23,7 @@ import * as HttpRouter from "effect/http/HttpRouter";
 import * as HttpApi from "effect/http-api/HttpApi";
 import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
 import * as NetAddress from "effect/net/NetAddress";
-import { decodeJwt, importSPKI, jwtVerify } from "jose";
-import { RELAY_LINK_PROOF_TYP } from "@t3tools/shared/relayJwt";
+import { decodeRelayJwt, RELAY_LINK_PROOF_TYP, verifyRelayJwt } from "@t3tools/shared/relayJwt";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as AuthHttp from "../auth/http.ts";
@@ -52,7 +52,7 @@ const proofRequest: RelayLinkProofRequest = {
   },
   origin: { localHttpHost: "127.0.0.1", localHttpPort: 3773 },
 };
-const decodeLinkProofPayload = Schema.decodeUnknownSync(RelayEnvironmentLinkProofPayload);
+const decodeLinkProofPayload = Schema.decodeUnknownEffect(RelayEnvironmentLinkProofPayload);
 
 class LinkProofTestApi extends HttpApi.make("environment").add(
   EnvironmentHttpApi.groups.auth,
@@ -112,7 +112,7 @@ const layerLinkProofRoutes = HttpApiBuilder.layer(LinkProofTestApi).pipe(
   Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
 );
 
-const withLinkProofClient = async (
+const withLinkProofClient = async <A = void>(
   body: (client: {
     post: (
       path: string,
@@ -121,8 +121,8 @@ const withLinkProofClient = async (
       origin?: string,
     ) => Promise<Response>;
     exchange: (credential: string, scope?: string) => Promise<string>;
-  }) => Promise<void>,
-) => {
+  }) => Promise<A>,
+): Promise<A> => {
   const { handler, dispose } = HttpRouter.toWebHandler(layerLinkProofRoutes, {
     disableLogger: true,
   });
@@ -157,39 +157,50 @@ const withLinkProofClient = async (
     return payload.access_token;
   };
   try {
-    await body({ post, exchange });
+    return await body({ post, exchange });
   } finally {
     await dispose();
   }
 };
 
 describe("link proof over a non-loopback desktop transport", () => {
-  it("signs a loopback tunnel origin after desktop bootstrap token exchange over a non-loopback host", () =>
-    withLinkProofClient(async ({ post, exchange }) => {
-      const token = await exchange(DESKTOP_BOOTSTRAP_TOKEN);
-      const response = await post("/api/connect/link-proof", proofRequest, {
-        authorization: `Bearer ${token}`,
-      });
-      expect(response.status).toBe(200);
-      const proof = (await response.json()) as string;
-      const payload = decodeLinkProofPayload(decodeJwt(proof));
-      const verified = await jwtVerify(
-        proof,
-        await importSPKI(payload.environmentPublicKey, "EdDSA"),
-        {
-          algorithms: ["EdDSA"],
+  it.effect(
+    "signs a loopback tunnel origin after desktop bootstrap token exchange over a non-loopback host",
+    () =>
+      Effect.gen(function* () {
+        const response = yield* Effect.promise(() =>
+          withLinkProofClient(async ({ post, exchange }) => {
+            const token = await exchange(DESKTOP_BOOTSTRAP_TOKEN);
+            const response = await post("/api/connect/link-proof", proofRequest, {
+              authorization: `Bearer ${token}`,
+            });
+            return {
+              status: response.status,
+              cacheControl: response.headers.get("cache-control"),
+              proof: (await response.json()) as string,
+            };
+          }),
+        );
+        expect(response.status).toBe(200);
+        expect(response.cacheControl).toBe("no-store");
+        const unverified = yield* decodeRelayJwt(response.proof).pipe(
+          Effect.flatMap(decodeLinkProofPayload),
+        );
+        yield* TestClock.setTime(unverified.iat * 1_000);
+        const verified = yield* verifyRelayJwt(RelayEnvironmentLinkProofPayload, {
+          publicKey: unverified.environmentPublicKey,
+          token: response.proof,
           typ: RELAY_LINK_PROOF_TYP,
           issuer: "t3-env:wsl-environment",
           audience: proofRequest.relayIssuer,
-        },
-      );
-      expect(verified.payload).toMatchObject({
-        origin: proofRequest.origin,
-        endpoint: proofRequest.endpoint,
-        challenge: proofRequest.challenge,
-      });
-      expect(response.headers.get("cache-control")).toBe("no-store");
-    }));
+        });
+        expect(verified).toMatchObject({
+          origin: proofRequest.origin,
+          endpoint: proofRequest.endpoint,
+          challenge: proofRequest.challenge,
+        });
+      }).pipe(Effect.provide(NodeCrypto.layerSignature)),
+  );
 
   it("does not pass desktop trust to a paired client or accept client-supplied provenance", () =>
     withLinkProofClient(async ({ post, exchange }) => {
